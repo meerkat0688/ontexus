@@ -7,10 +7,12 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from jose import jwt
+from sqlalchemy.orm import sessionmaker
 
 from app.config import settings
 from app.models.chatgpt_oauth import ChatGptAccountLink, ChatGptLoginTransaction
 from app.models.user import User
+from app.services.auth_service import hash_password
 from app.services.chatgpt_oauth import (
     AUTHORIZE_URL,
     ChatGptLoginError,
@@ -18,6 +20,7 @@ from app.services.chatgpt_oauth import (
     build_authorization_url,
     exchange_authorization_code,
     pkce_challenge,
+    resolve_user,
     verify_id_token,
 )
 
@@ -214,6 +217,37 @@ def test_callback_does_not_link_an_existing_email(client, db, admin_user, monkey
     assert response.headers["location"].endswith("/login?chatgpt_error=email_in_use")
     assert db.query(ChatGptAccountLink).count() == 0
     assert db.query(User).count() == 1
+
+
+def test_verified_email_claimed_during_create_is_email_in_use(db, monkeypatch):
+    """A second subject can pass the email check before the first insert commits."""
+    monkeypatch.setattr(settings, "chatgpt_oauth_client_id", CLIENT_ID)
+    other = sessionmaker(bind=db.get_bind())()
+
+    def claim_email_before_insert(_db, email, _subject):
+        other.add(User(
+            id="user-already-claimed",
+            username="claimed-ada",
+            email=email,
+            password_hash=hash_password("unused"),
+            role="viewer",
+        ))
+        other.commit()
+        return "chatgpt-ada"
+
+    monkeypatch.setattr("app.services.chatgpt_oauth._username_for", claim_email_before_insert)
+    try:
+        with pytest.raises(ChatGptLoginError) as caught:
+            resolve_user(db, {
+                "sub": "chatgpt-user-2",
+                "email": "ada@example.com",
+                "email_verified": True,
+            })
+        assert caught.value.code == "email_in_use"
+        assert db.query(User).filter(User.email == "ada@example.com").count() == 1
+        assert db.query(ChatGptAccountLink).count() == 0
+    finally:
+        other.close()
 
 
 def test_unverified_email_does_not_claim_an_existing_account(client, db, admin_user, monkeypatch):

@@ -17,6 +17,7 @@ from urllib.parse import urlencode
 
 import httpx
 from jose import JWTError, jwt
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -301,14 +302,23 @@ def resolve_user(db: Session, claims: dict) -> User:
         password_hash=hash_password(secrets.token_urlsafe(32)),
         role="viewer",
     )
-    db.add(user)
-    db.flush()
-    db.add(ChatGptAccountLink(
+    link = ChatGptAccountLink(
         user_id=user.id,
         issuer=ISSUER,
         client_id=client_id,
         subject=subject,
         email=link_email,
-    ))
-    db.flush()
+    )
+    # The email check above can lose to a concurrent insert. Race the new
+    # user inside a savepoint so the unique violation becomes email_in_use
+    # and leaves the surrounding transaction usable.
+    try:
+        with db.begin_nested():
+            db.add(user)
+            db.add(link)
+            db.flush()
+    except IntegrityError:
+        if link_email and db.query(User.id).filter(User.email == link_email).first():
+            raise ChatGptLoginError("email_in_use") from None
+        raise
     return user
